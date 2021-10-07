@@ -31,14 +31,21 @@ logging.getLogger().setLevel(logging.INFO)
 CHECKMK_USER = os.getenv("CHECKMK_USER", "myuser")
 CHECKMK_PASSWORD = os.getenv("CHECKMK_PASSWORD", "mypassword")
 CHECKMK_URL = os.getenv("CHECKMK_URL", "https://mycheckmk/mysite")
+CHECKMK_SITE = CHECKMK_URL.split("/")[-1]
 
 RULESET_NAME = "active_checks:http"
 
+path_activate_changes = "/check_mk/webapi.py?action=activate_changes"
 path_get_rule = "/check_mk/webapi.py?action=get_ruleset"
 path_set_rule = "/check_mk/webapi.py?action=set_ruleset"
 params_auth = f"&_username={CHECKMK_USER}&_secret={CHECKMK_PASSWORD}"
 params_format = "&request_format=python&output_format=python"
 params_ruleset_name = "&ruleset_name=" + RULESET_NAME
+
+
+def get_url_activate_changes():
+    """Return url activate_changes"""
+    return CHECKMK_URL + path_activate_changes + params_auth + params_format
 
 
 def get_url_get_rule():
@@ -53,6 +60,29 @@ def get_url_set_rule():
     return (
         CHECKMK_URL + path_set_rule + params_auth + params_format + params_ruleset_name
     )
+
+
+def convert_string_python2(request_string):
+    """
+    python2: print(repr(u'\xf4')) -> u'\xf4
+    python3: print(repr(u'\xf4')) -> 'ô'
+    In order to Checkmk accept the new ruleset, this function convert all non-ascii chars to corresponding hex escaped as Python 2 usually does
+    Otherwise, will return the error 'Check_MK exception: ERROR: Non-ASCII characters are not allowed here.'
+    Excerpted from:
+    https://github.com/tribe29/checkmk/blob/e75552431ae27be29b248e65bf7afdcfda03d83d/cmk/utils/python_printer.py
+    """
+    chars: List[str] = []
+    for c in request_string:
+        if ord(c) > 127:
+            chars.append("\\x{:02x}".format(ord(c)))
+        else:
+            chars.append(str(c))
+
+    request_string = "".join(chars)
+    request_string = request_string.replace("'name': ", "'name': u")
+    request_string = request_string.replace("'comment': ", "'comment': u")
+    request_string = request_string.replace("'expect_string': ", "'expect_string': u")
+    return request_string
 
 
 def create_rule(host_name, monitor):
@@ -122,7 +152,7 @@ def update_ruleset(ruleset, config_hash):
     resp_ruleset[""] = ruleset
     req["ruleset"] = resp_ruleset
     req["configuration_hash"] = config_hash
-    request_string = "request=" + str(req)
+    request_string = "request=" + convert_string_python2(repr(req))
     request_string = parse.quote(request_string, safe='{[]}"=, :')
     req = request.Request(get_url_set_rule(), request_string.encode())
     resp = request.urlopen(req)
@@ -141,6 +171,27 @@ def get_ruleset_confighash():
     logging.info("Ruleset {} has {} rules".format(RULESET_NAME, len(ret["ruleset"])))
     logging.info("Configuration hash: {}".format(ret["config_hash"]))
     return ret
+
+
+def activate_changes():
+    """Same as:
+    curl "http://myserver/mysite/check_mk/webapi.py?_secret=myautomationsecret&_username=automation&action=activate_changes"
+    \ -d 'request={"sites":["mysite"],"allow_foreign_changes":"1"}'
+    """
+    logging.info(f"Updating {CHECKMK_SITE}")
+    logging.info("Requesting URL: {}".format(get_url_activate_changes()))
+    req = {}
+    req["mode"] = "specific"
+    resposta["sites"] = [CHECKMK_SITE]
+    resposta[
+        "allow_foreign_changes"
+    ] = "1"  # ATTENTION: all changes will be applied (including from other users)
+    req["comment"] = "Changes made by automation"
+    request_string = "request=" + convert_string_python2(repr(req))
+    request_string = parse.quote(request_string, safe='{[]}"=, :')
+    req = request.Request(get_url_activate_changes(), request_string.encode())
+    resp = request.urlopen(req)
+    return resp.read()
 
 
 def main():
@@ -163,6 +214,8 @@ def main():
         ruleset.append(new_rule)
         ret_update = update_ruleset(ruleset, config_hash)
         print(ret_update)
+        ret_activate_changes = activate_changes()
+        print(ret_activate_changes)
     except Exception as e:
         logging.exception(e)
 
